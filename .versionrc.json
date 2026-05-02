@@ -1,0 +1,5 @@
+{
+  "scripts": {
+    "postbump": "cmake -B build -S . && git add include/uuid_v8/uuid_v8.hpp"
+  }
+}

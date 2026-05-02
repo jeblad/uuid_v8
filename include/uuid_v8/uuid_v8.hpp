@@ -1,0 +1,524 @@
+/**
+ * uuid_v8 – A C++20 library to generate and parse UUIDv8
+ * Version 0.0.0
+ *
+ * This header provides a C++20 single-header library for generating and parsing UUIDv8.
+ * It implements a Nilsimsa-style 128-bit similarity digest for targets,
+ * embedded within the UUIDv8 structure for efficient fuzzy matching.
+ * The algorithm uses a high-performance, single-pass sparse encoding strategy 
+ * on UTF-8 N-grams with a sliding window, avoiding the overhead of 
+ * multi-pass verification stages.
+ * It supports both static string processing and an optimized streaming interface
+ * using a triple ring-buffer strategy for real-time similarity detection.
+ * For detailed algorithmic explanation, refer to the project's README.md.
+ *
+ * Copyright (C) 2008-2026 John Erling Blad
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3 of the License.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * <https://www.gnu.org/licenses/>.
+ **/
+
+#ifndef UUID_V8_HPP
+#define UUID_V8_HPP
+
+#include <string_view>
+#include <cstdint>
+#include <array>
+#include <bit>
+#include <concepts>
+#include <functional>
+#include <string>
+#include <numeric>
+#include <vector>
+
+namespace uuid_v8 {
+
+namespace detail {
+    /**
+     * Helper to wrap raw pointers into string_views for the strategies.
+     */
+    template<typename T>
+    constexpr std::basic_string_view<T> make_view(const T* ptr) {
+        return ptr ? std::basic_string_view<T>(ptr) : std::basic_string_view<T>();
+    }
+
+    /**
+     * Fixed-size character unit to avoid std::string allocations in the hot path.
+     * Initialized by default to a single space for N-gram padding.
+     */
+    struct char_unit {
+        char data[4] = {' ', 0, 0, 0};
+        uint8_t len = 1;
+
+        constexpr char_unit() = default;
+        explicit constexpr char_unit(std::string_view sv) noexcept : data{0,0,0,0}, len(0) {
+            len = static_cast<uint8_t>(sv.size() > 4 ? 4 : sv.size());
+            for (uint8_t i = 0; i < len; ++i) data[i] = sv[i];
+        }
+        constexpr operator std::string_view() const noexcept { return {data, len}; }
+    };
+
+    // Bottom-up foundation: FNV-1a for sparse encoding
+    [[maybe_unused]] constexpr uint64_t FNV_OFFSET_BASIS = 0xcbf29ce484222325;
+    [[maybe_unused]] constexpr uint64_t FNV_PRIME = 0x100000001b3;
+
+    constexpr uint64_t fnv1a_update(uint64_t hash, char c) noexcept {
+        return (hash ^ static_cast<uint8_t>(c)) * FNV_PRIME;
+    }
+
+    [[nodiscard]] constexpr uint64_t fnv1a_hash(std::string_view s) noexcept {
+        return std::accumulate(s.begin(), s.end(), FNV_OFFSET_BASIS, fnv1a_update);
+    }
+
+    /**
+     * Recursive template to unroll the setting of M sparse bits.
+     */
+    template<size_t M, size_t Range = 122>
+    struct sparse_bit_setter {
+        static constexpr void apply(uint64_t& high, uint64_t& low, uint64_t hash) noexcept {
+            size_t idx = hash % Range;
+            if (idx < 60) {
+                if (idx >= 48) idx += 4;
+                high |= (1ULL << idx);
+            } else {
+                low |= (1ULL << (idx - 60));
+            }
+            sparse_bit_setter<M - 1, Range>::apply(high, low, hash * 0xbf58476d1ce4e5b9ULL + 1);
+        }
+    };
+
+    template<size_t Range>
+    struct sparse_bit_setter<0, Range> {
+        static constexpr void apply(uint64_t&, uint64_t&, uint64_t) noexcept {}
+    };
+
+    /**
+     * Recursive template to update weighted bit counters for the observer.
+     */
+    template<bool Increment, size_t M_bits, size_t Range = 122>
+    struct counter_updater {
+        static constexpr void apply(std::array<uint8_t, Range>& counters, uint64_t hash) noexcept {
+            size_t idx = hash % Range;
+            if constexpr (Increment) {
+                if (counters[idx] < 255) counters[idx]++;
+            } else if (counters[idx] > 0) {
+                counters[idx]--;
+            }
+            counter_updater<Increment, M_bits - 1, Range>::apply(counters, hash * 0xbf58476d1ce4e5b9ULL + 1);
+        }
+    };
+
+    template<bool Increment, size_t Range>
+    struct counter_updater<Increment, 0, Range> {
+        static constexpr void apply(std::array<uint8_t, Range>&, uint64_t) noexcept {}
+    };
+
+    /**
+     * Determines the number of bytes in a UTF-8 code point based on its lead byte.
+     */
+    constexpr size_t utf8_cp_bytes(uint8_t lead) {
+        if ((lead & 0x80) == 0) return 1; 
+        auto ones = std::countl_one(lead);
+        if (ones < 2 || ones > 4) return 1;
+        return static_cast<size_t>(ones);
+    }
+
+    /**
+     * Peeks at the next code point without advancing, returning it as a string_view.
+     */
+    constexpr std::string_view peek_codepoint(std::string_view s) {
+        if (s.empty()) return {};
+        size_t len = utf8_cp_bytes(static_cast<uint8_t>(s[0]));
+        return s.substr(0, std::min(len, s.size()));
+    }
+
+    /**
+     * Calculates the number of code points (semantic UTF-8 length) in a string.
+     */
+    constexpr size_t codepoint_length(std::string_view s) {
+        size_t cp_count = 0;
+        for (size_t i = 0; i < s.size(); ) {
+            i += utf8_cp_bytes(static_cast<uint8_t>(s[i]));
+            cp_count++;
+        }
+        return cp_count;
+    }
+
+    /**
+     * Calculates the normal character count (raw byte length) in a string.
+     */
+    constexpr size_t byte_length(std::string_view s) {
+        return s.size();
+    }
+
+    // Internal implementations for default strategies
+    template<typename T = char>
+    struct byte_strategy_impl {
+        static constexpr size_t length(std::basic_string_view<T> s) { return s.size(); }
+        static constexpr size_t advance(std::basic_string_view<T> s, size_t pos) {
+            return (pos < s.size()) ? 1 : 0;
+        }
+        static constexpr std::basic_string_view<T> get_window(std::basic_string_view<T> s, size_t pos, size_t n) {
+            if (pos >= s.size()) return {};
+            size_t end = std::min(pos + n, s.size());
+            return s.substr(pos, end - pos);
+        }
+    };
+
+    struct utf8_strategy_impl {
+        static constexpr size_t length(std::string_view s) { return codepoint_length(s); }
+        static constexpr size_t advance(std::string_view s, size_t pos) {
+            if (pos >= s.size()) return 0;
+            return utf8_cp_bytes(static_cast<uint8_t>(s[pos]));
+        }
+        static constexpr std::string_view get_window(std::string_view s, size_t pos, size_t n) {
+            if (pos >= s.size()) return {};
+            size_t end = pos;
+            for (size_t i = 0; i < n && end < s.size(); ++i) {
+                end += utf8_cp_bytes(static_cast<uint8_t>(s[end]));
+            }
+            return s.substr(pos, end - pos);
+        }
+    };
+} // namespace detail
+
+// Public Concepts for Dependency Injection
+
+template <typename S, typename T = char>
+concept IndexingStrategy = requires(std::basic_string_view<T> s, size_t pos, size_t n) {
+    { S::length(s) } -> std::same_as<size_t>;
+    { S::advance(s, pos) } -> std::same_as<size_t>;
+    { S::get_window(s, pos, n) } -> std::same_as<std::basic_string_view<T>>;
+};
+
+template <typename N>
+concept NormalizationStrategy = requires(char c) {
+    { N::normalize(c) } -> std::same_as<char>;
+    { N::is_filtered(std::string_view{}) } -> std::same_as<bool>;
+};
+
+template <typename H>
+concept HashingStrategy = requires(uint64_t h, char c) {
+    { H::basis } -> std::convertible_to<uint64_t>;
+    { H::update(h, c) } -> std::same_as<uint64_t>;
+};
+
+template <typename S, size_t M>
+concept SparsityStrategy = requires(uint64_t& hi, uint64_t& lo, uint64_t h) {
+    { S::template apply<M>(hi, lo, h) } -> std::same_as<void>;
+};
+
+// Publicly discoverable strategy types
+
+using byte_strategy = detail::byte_strategy_impl<char>;
+using utf8_strategy = detail::utf8_strategy_impl;
+
+// Publicly discoverable normalization strategies
+
+/**
+ * Default normalization: No changes, no filtering.
+ */
+struct nop_normalization_strategy {
+    static constexpr char normalize(char c) noexcept { return c; }
+    static constexpr bool is_filtered(std::string_view) noexcept { return false; }
+};
+
+struct case_insensitive_strategy {
+    static constexpr char normalize(char c) noexcept {
+        // Fast case-folding for ASCII
+        if (c >= 'A' && c <= 'Z') return static_cast<char>(c + ('a' - 'A'));
+        // Keep lowercase and numbers
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) return c;
+        return ' ';
+    }
+    static constexpr bool is_filtered(std::string_view s) noexcept {
+        if (s.size() != 1) return true; // Filter multi-byte
+        char c = s[0];
+        return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ');
+    }
+};
+
+struct case_sensitive_strategy {
+    static constexpr char normalize(char c) noexcept {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+        return ' ';
+    }
+    static constexpr bool is_filtered(std::string_view s) noexcept {
+        if (s.size() != 1) return true;
+        char c = s[0];
+        return !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ');
+    }
+};
+
+struct fnv1a_hashing_strategy {
+    [[maybe_unused]] static constexpr uint64_t basis = detail::FNV_OFFSET_BASIS;
+    static constexpr uint64_t update(uint64_t hash, char c) noexcept {
+        return detail::fnv1a_update(hash, c);
+    }
+};
+
+struct default_sparsity_strategy {
+    template<size_t M, size_t Range = 122>
+    static constexpr void apply(uint64_t& high, uint64_t& low, uint64_t hash) noexcept {
+        detail::sparse_bit_setter<M, Range>::apply(high, low, hash);
+    }
+};
+
+// Aliases for backward compatibility
+using byte_counting_strategy = byte_strategy;
+using codepoint_counting_strategy = utf8_strategy;
+
+class uuid {
+public:
+    struct raw_bytes {
+        uint64_t high; // Contains version (bits 48-51)
+        uint64_t low;  // Contains variant (bits 62-63)
+
+        bool operator==(const raw_bytes&) const = default;
+    };
+
+    uuid() : data_{0, 0} {}
+    explicit uuid(raw_bytes b) : data_(b) { apply_version_variant_mask(); }
+
+    const raw_bytes& as_bytes() const { return data_; }
+
+    bool operator==(const uuid& other) const = default;
+
+    // The "Bean Counting" logic
+    // Ignores the 6 fixed bits of the UUID spec to prevent similarity bias
+    [[nodiscard]] static int hamming_distance(const uuid& a, const uuid& b) noexcept {
+        constexpr uint64_t high_mask = 0xFFF0FFFFFFFFFFFFULL; // Mask out version
+        constexpr uint64_t low_mask  = 0x3FFFFFFFFFFFFFFFULL; // Mask out variant
+
+        uint64_t diff_high = (a.data_.high ^ b.data_.high) & high_mask;
+        uint64_t diff_low  = (a.data_.low ^ b.data_.low) & low_mask;
+
+        return std::popcount(diff_high) + std::popcount(diff_low);
+    }
+
+    // Counts bits that are set in BOTH uuids (Intersection)
+    [[nodiscard]] static int shared_bits(const uuid& a, const uuid& b) noexcept {
+        constexpr uint64_t high_mask = 0xFFF0FFFFFFFFFFFFULL;
+        constexpr uint64_t low_mask  = 0x3FFFFFFFFFFFFFFFULL;
+
+        uint64_t shared_high = (a.data_.high & b.data_.high) & high_mask;
+        uint64_t shared_low  = (a.data_.low & b.data_.low) & low_mask;
+
+        return std::popcount(shared_high) + std::popcount(shared_low);
+    }
+
+    // Returns total bits set in this uuid (ignoring version/variant)
+    [[nodiscard]] int popcount() const noexcept {
+        constexpr uint64_t high_mask = 0xFFF0FFFFFFFFFFFFULL;
+        constexpr uint64_t low_mask  = 0x3FFFFFFFFFFFFFFFULL;
+        return std::popcount(data_.high & high_mask) + std::popcount(data_.low & low_mask);
+    }
+
+    [[nodiscard]] float similarity(const uuid& other) const noexcept {
+        // 122 bits available for custom data in UUIDv8
+        return 1.0f - (static_cast<float>(hamming_distance(*this, other)) / 122.0f);
+    }
+
+    // Jaccard Similarity: Intersection / Union
+    [[nodiscard]] float jaccard_similarity(const uuid& other) const noexcept {
+        int shared = shared_bits(*this, other);
+        int union_bits = this->popcount() + other.popcount() - shared;
+        if (union_bits == 0) return 1.0f;
+        return static_cast<float>(shared) / static_cast<float>(union_bits);
+    }
+
+    /**
+     * The NGramGenerator logic. 
+     * Implements virtual padding to ensure boundaries are captured.
+     */
+    template<size_t N = 3, 
+             size_t M = 2, 
+             IndexingStrategy Strategy = utf8_strategy, 
+             NormalizationStrategy Normalization = nop_normalization_strategy,
+             HashingStrategy Hashing = fnv1a_hashing_strategy,
+             typename Sparsity = default_sparsity_strategy>
+    requires SparsityStrategy<Sparsity, M>
+    void generate(std::string_view input) noexcept {
+        if (input.empty()) return;
+
+        std::array<std::string_view, N> window;
+        window.fill(" "); 
+        size_t input_pos = 0;
+
+        // Implementation of Filtering/Stripping logic:
+        // We only advance the window for non-filtered semantic units.
+        while (input_pos < input.size()) {
+            auto unit = Strategy::get_window(input, input_pos, 1);
+            input_pos += unit.size();
+
+            if (Normalization::is_filtered(unit)) continue;
+
+            for (size_t j = 0; j < N - 1; ++j) window[j] = window[j + 1];
+            window[N - 1] = unit;
+            compute_and_set_hash<N, M, Normalization, Hashing, Sparsity>(window);
+        }
+
+        // Loop Peeling: Phase 3 (Trailing Padding)
+        for (size_t i = 0; i < N - 1; ++i) {
+            for (size_t j = 0; j < N - 1; ++j) window[j] = window[j + 1];
+            window[N - 1] = " ";
+
+            compute_and_set_hash<N, M, Normalization, Hashing, Sparsity>(window);
+        }
+
+        // Ensure the final digest is a valid UUIDv8
+        apply_version_variant_mask();
+    }
+
+    // Internal helper to count how many grams would be produced
+    template<size_t N = 3, IndexingStrategy Strategy = utf8_strategy>
+    static constexpr size_t count_grams(std::string_view input) noexcept {
+        if (input.empty()) return 0;
+        return Strategy::length(input) + N - 1;
+    }
+
+private:
+    raw_bytes data_;
+
+    void apply_version_variant_mask() {
+        // UUID v8: Custom version
+        data_.high = (data_.high & 0xFFF0FFFFFFFFFFFFULL) | 0x0008000000000000ULL;
+        // UUID Variant: 10xxxxxx (RFC 4122)
+        data_.low = (data_.low & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+    }
+
+    template<size_t M>
+    void set_sparse_bits(uint64_t hash) noexcept {
+        detail::sparse_bit_setter<M>::apply(data_.high, data_.low, hash);
+    }
+
+    template<size_t N, size_t M, typename Normalization, typename Hashing, typename Sparsity>
+    void compute_and_set_hash(const std::array<std::string_view, N>& window) noexcept {
+        uint64_t hash = Hashing::basis;
+        for (const auto& unit : window) {
+            for (char c : unit) {
+                hash = Hashing::update(hash, Normalization::normalize(c));
+            }
+        }
+        Sparsity::template apply<M>(data_.high, data_.low, hash);
+    }
+};
+
+/**
+ * observer – A streaming matcher that monitors a character stream.
+ * It maintains a rolling sparse digest and fires a callback when the 
+ * Jaccard similarity to a target exceeds a threshold.
+ */
+template<size_t N = 3, 
+         size_t M = 2, 
+         size_t L = 10, 
+         IndexingStrategy Strategy = utf8_strategy,
+         NormalizationStrategy Normalization = nop_normalization_strategy,
+         HashingStrategy Hashing = fnv1a_hashing_strategy,
+         typename Sparsity = default_sparsity_strategy>
+class observer {
+public:
+    using callback_t = std::function<void(const uuid& actual, float score)>;
+
+    observer(uuid target, float threshold, callback_t cb)
+        : target_(target), threshold_(threshold), on_match_(std::move(cb)) {
+        window_units_.fill(detail::char_unit(" "));
+        // A target of length L produces G = L + N - 1 grams.
+        // We track the last G hashes to maintain a rolling weighted bitset.
+        gram_hashes_.fill(0);
+        bit_counters_.fill(0);
+    }
+
+    /**
+     * push – Consumes a single character from the stream.
+     * This is the "snooping" entry point.
+     */
+    void push(char c) noexcept {
+        if (partial_accum_.len >= 4) partial_accum_.len = 0; 
+        partial_accum_.data[partial_accum_.len++] = c;
+
+        std::string_view view(partial_accum_.data, partial_accum_.len);
+        size_t needed = Strategy::advance(view, 0);
+
+        if (needed > 0 && needed <= partial_accum_.len) {
+            process_unit(view.substr(0, needed));
+            partial_accum_.len = 0;
+        }
+    }
+
+private:
+    static constexpr size_t G = L + N - 1; // Number of grams in the sliding window
+
+    uuid target_;
+    float threshold_;
+    callback_t on_match_;
+    
+    detail::char_unit partial_accum_{ "" };
+    std::array<detail::char_unit, N> window_units_;
+    std::array<uint64_t, G> gram_hashes_;
+    std::array<uint8_t, 122> bit_counters_; // Weighted bitset (counters for 122 bits)
+    size_t head_ = 0;
+
+    void process_unit(std::string_view unit) noexcept {
+        if (Normalization::is_filtered(unit)) return;
+
+        // 1. Shift the N-gram sliding window
+        for (size_t i = 0; i < N - 1; ++i) window_units_[i] = window_units_[i + 1];
+        window_units_[N - 1] = detail::char_unit(unit);
+
+        // 2. Compute the new gram hash
+        uint64_t h = Hashing::basis;
+        for (const auto& u : window_units_) {
+            std::string_view sv = u;
+            for (char c : sv) h = Hashing::update(h, Normalization::normalize(c));
+        }
+
+        // 3. Retire the oldest gram's influence from the bit counters
+        update_counters<false>(gram_hashes_[head_]);
+
+        // 4. Add the new gram's influence
+        gram_hashes_[head_] = h;
+        update_counters<true>(h);
+
+        // 5. Advance ring buffer head
+        head_ = (head_ + 1) % G;
+
+        // 6. Check similarity
+        uuid current = snapshot();
+        float score = current.jaccard_similarity(target_);
+        if (score >= threshold_) {
+            on_match_(current, score);
+        }
+    }
+
+    template<bool Increment>
+    void update_counters(uint64_t h) noexcept {
+        if (h == 0) return;
+        detail::counter_updater<Increment, M>::apply(bit_counters_, h);
+    }
+
+    uuid snapshot() const noexcept {
+        uuid::raw_bytes b{0, 0};
+        for (size_t i = 0; i < 122; ++i) {
+            if (bit_counters_[i] > 0) {
+                if (i < 60) {
+                    size_t idx = (i >= 48) ? i + 4 : i;
+                    b.high |= (1ULL << idx);
+                } else b.low |= (1ULL << (i - 60));
+            }
+        }
+        return uuid(b);
+    }
+};
+
+} // namespace uuid_v8
+
+#endif // UUID_V8_HPP
