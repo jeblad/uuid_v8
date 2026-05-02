@@ -34,18 +34,11 @@ if(Git_FOUND)
         set(UUID_V8_FULL_VERSION "${GIT_VERSION}")
     endif()
 
-    # Git Hook Automation
-    set(HOOK_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/scripts/pre-commit.sh")
-    set(HOOK_DEST "${CMAKE_CURRENT_SOURCE_DIR}/.git/hooks/pre-commit")
-    
-    if(EXISTS "${HOOK_SOURCE}")
-        if(UNIX)
-            execute_process(COMMAND ${CMAKE_COMMAND} -E create_symlink "${HOOK_SOURCE}" "${HOOK_DEST}")
-            file(CHMOD "${HOOK_SOURCE}" PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-        else()
-            execute_process(COMMAND ${CMAKE_COMMAND} -E copy "${HOOK_SOURCE}" "${HOOK_DEST}")
-        endif()
-        message(STATUS "Git pre-commit hook installed/updated.")
+    # Automated Versioning Pipeline: Install Git pre-commit hook
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+        configure_file(pre-commit.in "${CMAKE_CURRENT_SOURCE_DIR}/.git/hooks/pre-commit" @ONLY)
+        execute_process(COMMAND chmod +x "${CMAKE_CURRENT_SOURCE_DIR}/.git/hooks/pre-commit")
+        message(STATUS "Git pre-commit hook installed.")
     endif()
 
 endif()
