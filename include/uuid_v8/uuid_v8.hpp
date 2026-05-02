@@ -1,6 +1,6 @@
 /**
  * uuid_v8 – A C++20 library to generate and parse UUIDv8
- * Version 0.0.1
+ * Version 0.0.2
  *
  * This header provides a C++20 single-header library for generating and parsing UUIDv8.
  * It implements a Nilsimsa-style 128-bit similarity digest for targets,
