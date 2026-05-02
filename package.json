@@ -2,6 +2,7 @@
   "name": "uuid_v8",
   "version": "0.0.1",
   "license": "GPL-3.0-only",
+  "private": true,
   "devDependencies": {
     "commit-and-tag-version": "^12.7.1"
   },
