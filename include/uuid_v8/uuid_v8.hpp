@@ -1,6 +1,6 @@
 /**
  * uuid_v8 – A C++20 library to generate and parse UUIDv8
- * Version 0.0.2
+ * Version 0.0.3
  *
  * This header provides a C++20 single-header library for generating and parsing UUIDv8.
  * It implements a Nilsimsa-style 128-bit similarity digest for targets,
@@ -295,7 +295,7 @@ public:
     // The "Bean Counting" logic
     // Ignores the 6 fixed bits of the UUID spec to prevent similarity bias
     [[nodiscard]] static int hamming_distance(const uuid& a, const uuid& b) noexcept {
-        constexpr uint64_t high_mask = 0xFFF0FFFFFFFFFFFFULL; // Mask out version
+        constexpr uint64_t high_mask = 0xFFFFFFFFFFFF0FFFULL; // Mask out version
         constexpr uint64_t low_mask  = 0x3FFFFFFFFFFFFFFFULL; // Mask out variant
 
         uint64_t diff_high = (a.data_.high ^ b.data_.high) & high_mask;
@@ -306,7 +306,7 @@ public:
 
     // Counts bits that are set in BOTH uuids (Intersection)
     [[nodiscard]] static int shared_bits(const uuid& a, const uuid& b) noexcept {
-        constexpr uint64_t high_mask = 0xFFF0FFFFFFFFFFFFULL;
+        constexpr uint64_t high_mask = 0xFFFFFFFFFFFF0FFFULL;
         constexpr uint64_t low_mask  = 0x3FFFFFFFFFFFFFFFULL;
 
         uint64_t shared_high = (a.data_.high & b.data_.high) & high_mask;
@@ -317,7 +317,7 @@ public:
 
     // Returns total bits set in this uuid (ignoring version/variant)
     [[nodiscard]] int popcount() const noexcept {
-        constexpr uint64_t high_mask = 0xFFF0FFFFFFFFFFFFULL;
+        constexpr uint64_t high_mask = 0xFFFFFFFFFFFF0FFFULL;
         constexpr uint64_t low_mask  = 0x3FFFFFFFFFFFFFFFULL;
         return std::popcount(data_.high & high_mask) + std::popcount(data_.low & low_mask);
     }
@@ -390,7 +390,7 @@ private:
 
     void apply_version_variant_mask() {
         // UUID v8: Custom version
-        data_.high = (data_.high & 0xFFF0FFFFFFFFFFFFULL) | 0x0008000000000000ULL;
+        data_.high = (data_.high & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000008000ULL;
         // UUID Variant: 10xxxxxx (RFC 4122)
         data_.low = (data_.low & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
     }

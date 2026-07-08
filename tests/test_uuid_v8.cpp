@@ -73,9 +73,9 @@ void test_hamming_and_masking() {
     using namespace uuid_v8;
 
     // Create two UUIDs with raw data that differs only in the version/variant bits
-    // Bits 48-51 are version, 62-63 are variant.
+    // Bits 12-15 are version, 62-63 are variant.
     uuid::raw_bytes r1{ 0x0ULL, 0x0ULL };
-    uuid::raw_bytes r2{ 0x000F000000000000ULL, 0xC000000000000000ULL };
+    uuid::raw_bytes r2{ 0x000000000000F000ULL, 0xC000000000000000ULL };
 
     uuid u1(r1);
     uuid u2(r2);
@@ -103,13 +103,13 @@ void test_version_variant_integrity() {
 
     // Create raw bytes with version bits set to 0xF and variant bits set to 0x3 (all 1s)
     // We want to verify the class forces them to the correct values (0x8 and 0x2 respectively)
-    uuid::raw_bytes input{ 0x000F000000000000ULL, 0xC000000000000000ULL };
+    uuid::raw_bytes input{ 0x000000000000F000ULL, 0xC000000000000000ULL };
     uuid u(input);
 
     auto output = u.as_bytes();
 
-    // Version 8 check: Bits 48-51 of high word must be 1000 (0x8)
-    TEST_ASSERT((output.high & 0x000F000000000000ULL) == 0x0008000000000000ULL);
+    // Version 8 check: Bits 12-15 of high word must be 1000 (0x8)
+    TEST_ASSERT((output.high & 0x000000000000F000ULL) == 0x0000000000008000ULL);
 
     // Variant check: Bits 62-63 of low word must be 10 (binary 10... -> 0x8 in the nibble)
     TEST_ASSERT((output.low & 0xC000000000000000ULL) == 0x8000000000000000ULL);
